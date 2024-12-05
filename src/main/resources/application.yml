@@ -1,0 +1,30 @@
+management:
+  server:
+    port: 8080
+  info:
+    java:
+      enabled: true
+    os:
+      enabled: true
+    env:
+      enabled: true
+    build:
+      enabled: true
+  endpoint:
+    shutdown:
+      enabled: true
+    health:
+      #show-details: always
+      show-components: always
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+      #base-path: "/ac"
+info:
+  app:
+    name: hello-actuator
+    company: errday
+logging:
+  level:
+    hello.hello.controller.LogController: debug
