@@ -442,7 +442,7 @@ scrape_configs:
 #### 게이지와 카운터
 메트릭은 크게 보면 게이지와 카운터라는 2가지로 분류 할 수 있다.
 
-#### 게이지(Guage)
+#### 게이지(Gauge)
 * 임의로 오르내일 수 있는 값
 * 예) CPU 사용량, 메모리 사용량, 사용중인 커넥션
 
@@ -495,3 +495,278 @@ scrape_configs:
 * JVM 메모리 사용량 초과
 * 커넥션 풀 고갈
 * 에러 로그 급증
+
+---
+# 모니터링 메트릭 활용
+CPU 사용량, 메모리 사용량, 톰캣 쓰레드, DB 커넥션 풀과 같은 공통으로 사용되는 기술 메트릭은 이미 등록되어있다.
+이런 이미 등록된 메트릭을 사용해서 대시보드를 구성하고 모니터링 하면된다.
+여기에 더 나아가 비즈니스에 특화된 메트릭을 사용해서 대시보드를 구성하고 모니터링 하면 된다.
+비즈니스에 관한 부분은 각 비즈니스 마다 구현이 다르다. 따라서 비즈니스 메트릭은 직접 등록하고 확인해야 한다.
+여기서는 우리 비즈니스의 실시간 주문수, 취소수 또는 실시간 재고 수량을 메트릭을 등록하고 확인해보자.
+
+## 메트릭 등록 - 카운터
+### MeterRegistry
+마이크로미터 기능을 제공하는 핵심 컴포넌트   
+스프링을 통해서 주입받아서 사용하고, 이곳을 통해서 카운터, 게이지 등을 등록한다.
+
+OrderServiceV1
+```java
+@Slf4j
+public class OrderServiceV1 implements OrderService {
+    private final MeterRegistry registry;
+    private AtomicInteger stock = new AtomicInteger(100);
+    
+    public OrderServiceV1(MeterRegistry registry) {
+        this.registry = registry;
+    }
+  
+    @Override
+    public void order() {
+        log.info("주문");
+        stock.decrementAndGet();
+        
+        Counter.builder("my.order")
+              .tag("class", this.getClass().getName())
+              .tag("method", "order")
+              .description("order")
+              .register(registry).increment();
+    }
+    
+    @Override
+    public void cancel() {
+        log.info("취소");
+        stock.incrementAndGet();
+        Counter.builder("my.order")
+              .tag("class", this.getClass().getName())
+              .tag("method", "cancel")
+              .description("order")
+              .register(registry).increment();
+    }
+  
+    @Override
+    public AtomicInteger getStock() {
+        return stock;
+    }
+}
+```
+* `Counter.builder(name)` 통해서 카운터를 생성한다. `name`에는 메트릭 이름을 지정한다.
+* `tag`를 사용했는데, 프로메테우스에서 필터할 수 있는 레이블로 사용된다.
+* 주문과 취소는 메트릭 이름은 같고 `tag`를 통해서 구분하도록 했다.
+* `register(registry)`: 만든 카운터를 `MeterRegistry`에 등록한다. 이렇게 등록해야 실제 동작한다.
+
+## @Counted
+앞서 만든 `OrderServiceV1`의 가장 큰 단점은 메트릭을 관리하는 로직이 핵심 비즈니스 개발 로직에 침투했다는 점이다.
+이런 부분을 AOP를 사용하면 분리할 수 있다.
+마이크로미터는 이런 상황에 맞추어 AOP 구성요소를 이미 다 만들어 두었다.
+
+
+```java
+public class OrderServiceV2 implements OrderService {
+
+    private AtomicInteger stock = new AtomicInteger(100);
+
+    @Counted("my.order")
+    @Override
+    public void order() {
+        log.info("주문");
+        stock.decrementAndGet();
+
+
+    }
+
+    @Counted("my.order")
+    @Override
+    public void cancel() {
+        log.info("취소");
+        stock.decrementAndGet();
+
+    }
+
+    @Override
+    public AtomicInteger getStock() {
+        return stock;
+    }
+}
+```
+* `@Counted` 애노테이션을 측정을 원하는 메서드에 적용한다. 
+* 그리고 메트릭 이름을 지정하면 된다.
+* `tag`에 `method`를 기준으로 분류해서 적용한다.
+
+
+```java
+@Configuration
+public class OrderConfigV2 {
+
+    @Bean
+    OrderService orderService() {
+        return new OrderServiceV2();
+    }
+
+    @Bean
+    public CountedAspect countedAspect(MeterRegistry registry) {
+        return new CountedAspect(registry);
+    }
+}
+```
+* `@CountedAspect`를 등록하면 `@Counted`를 인지해서 `Counter`를 사용하는 AOP를 적용한다.
+* 주의: `CountedAspect`를 빈으로 등록하지 않으면 `Counted` 관련 AOP가 동작하지 않는다.
+
+## Timer
+Timer는 좀 특별한 메트릭 측정 도구인데, 시간을 측정하는데 사용된다.
+* 카운터와 유사한데, `Timer`를 사요하면 실행 시간도 함께 측정할 수 있다.
+* `Timer`는 다음과 같은 내용을 한번에 측정해준다.
+  * `seconds_count`: 누적 실행 수 - `카운터`
+  * `seconds_sum`: 실행 시간의 함 - `sum`
+  * `seconds_max`: 최대 실행 시간(가장 오래걸린 실행 시간) - `게이지`
+  * 내부에 타임 윈도우라는 개념이 있어서 1~3분 마다 최대 실행 시간이 다시 계산된다.
+
+
+OrderServiceV3
+```java
+public class OrderServiceV3 implements OrderService {
+
+    private final MeterRegistry registry;
+    private AtomicInteger stock = new AtomicInteger(100);
+
+    public OrderServiceV3(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+
+    @Override
+    public void order() {
+        Timer timer = Timer.builder("my.order")
+                .tag("class", this.getClass().getName())
+                .tag("method", "order")
+                .register(registry);
+
+        timer.record(() -> {
+            log.info("주문");
+            stock.decrementAndGet();
+            sleep(500);
+        });
+    }
+
+    @Override
+    public void cancel() {
+        Timer timer = Timer.builder("my.order")
+                .tag("class", this.getClass().getName())
+                .tag("method", "cancel")
+                .register(registry);
+
+        timer.record(() -> {
+            log.info("취소");
+            stock.decrementAndGet();
+            sleep(500);
+        });
+    }
+
+    @Override
+    public AtomicInteger getStock() {
+        return stock;
+    }
+
+    private static void sleep(int millis) {
+        try {
+            Thread.sleep(millis + new Random().nextInt(200));
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+```
+* `Timer.builder(name)` 통해서 타이머를 생성한다. `name`에는 메트릭 이름을 지정한다.
+* `tag`를 사용했는데, 프로메테우스에서 필터할 수 있는 레이블로 사용된다.
+* 주문과 취소 메트릭 이름은 같고 `tag`를 통해서 구별 하도록 했다.
+* `register(registry)`: 만든 타이머를 `MeterRegistry`에 등록한다.
+* 타이머를 사용할 때는 `timer.record()`를 사용하면 된다. 그 안에서 시간을 측정할 내용을 함수로 포함하면된다.
+
+
+### @Timed
+타이머는 `@Timed`라는 애노테이션을 통해 AOP를 적용할 수 있다.
+
+## Gauge
+
+```java
+@Configuration
+public class StockConfigV1 {
+
+    @Bean
+    public MyStockMetric myStockMetric(OrderService orderService, MeterRegistry meterRegistry) {
+        return new MyStockMetric(orderService, meterRegistry);
+    }
+
+    @Slf4j
+    static class MyStockMetric {
+        private OrderService orderService;
+        private MeterRegistry registry;
+
+        public MyStockMetric(OrderService orderService, MeterRegistry registry) {
+            this.orderService = orderService;
+            this.registry = registry;
+        }
+
+        @PostConstruct
+        public void init() {
+            Gauge.builder("my.stock", orderService, service -> {
+                log.info("stock gauge");
+                return orderService.getStock().get();
+            }).register(registry);
+        }
+    }
+    
+}
+```
+`my.stock`이라는 이름으로 게이지를 등록했다.
+게이지를 만들 때 함수를 전달 했는데, 이 함수는 외부에서 메트릭을 확인할 때마다 호출된다.
+이 함수의 반환값이 게이지의 값이다.
+
+# 실무 모니터링 환경 구성 팁
+모니터링 3단계
+* 대시보드
+* 애플리케이션 추적 - 핀포인트
+* 로그
+
+## 대시 보드
+전체를 한 눈에 볼 수 있는 가장 높은 뷰
+
+### 제품
+마이크로미터, 프로메테우스, 그라파나
+
+### 모니터링 대상
+시스템 메트릭(CPU, 메모리)
+애플리케이션 메트릭(톰캣 쓰레드 풀, DB 커넥션 풀, 애플리케이션 호출 수)
+비즈니스 메트릭(주문수, 취소수)
+
+## 애플리케이션 추적
+주로 각각의 HTTP 요청을 추적, 일부는 마이크로서비스 환경에서 분산 추적
+
+### 제품
+핀포인트(오픈소스), 스카우트(오픈소스), 와탭(상용), 제니퍼(상용)
+
+## 로그
+가장 자세한 추적, 원하는데로 커스텀 가능
+같은 HTTP 요청을 묶어서 확인할 수 있는 방법이 중요, MDC 적용
+
+파일로 직접 로그를 남기는 경우     
+일반 로그와 에러로그는 파일을 구분해서 남기자
+에러 로그만 확인해서 문제를 바로 정리할 수 있음
+
+클라우드에 로그를 저장하는 경우     
+검색이 잘 되도록 구분
+
+## 모니터링 정리
+각각 용도가 다르다
+관찰을 할 때는 전체 -> 점점 좁게
+핀포인트는 정말 좋다. 강추 마이크로 서비스 분산 모니터링도 가능, 대용량 트래픽에 대응
+
+알람
+모니터링 툴에서 일정 이상 수치가 넘어가면, 슬랙, 문자 등을 연동
+
+알람은 2가지 종류로 꼭 구분해서 관리
+경고, 심각
+경고는 하루 1번 정도 사람이 적접 확인해도 되는 수준(사람이 들어가서 확인)
+심각은 즉시 확인해야 함. 슬랙 알림(앱을 통해 알림을 받도록), 문자, 전화
+
+
